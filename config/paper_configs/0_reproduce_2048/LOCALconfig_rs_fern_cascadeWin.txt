@@ -1,0 +1,31 @@
+# This replicates the paper result for "Fern"
+# when trained to 200k iters. Settings are the 
+# same for all other LLFF-style real scenes.
+
+expname = rs_paper_leaves_cascade
+basedir = D:\SHANG_Data\logs_0_nerf_llff_data
+datadir = D:\SHANG_Data\0_nerf_llff_data\leaves
+dataset_type = llff
+factor = 4
+llffhold = 8
+
+no_batching = False
+
+use_viewdirs = True
+lrate_decay = 250
+raw_noise_std = 1.0
+
+N_samples = 8
+N_importance = 64
+N_rand = 512
+
+max_global_steps = 6001
+chunk = 16000
+i_print = 10
+i_img = 50
+i_testset = 5000
+i_video = 5001
+
+flag_patch_ray = False
+pr_patch_size = 4
+flag_cascade = True

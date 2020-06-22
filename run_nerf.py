@@ -5,7 +5,6 @@ import sys
 import ast
 import time
 
-
 #self
 _curr_path = os.path.abspath(__file__) # /home/..../face
 _cur_dir = os.path.dirname(_curr_path) # ./
@@ -18,13 +17,14 @@ from tf_viewSyn.nerf.run_nerf_helpers import *
 from tf_viewSyn.nerf.load_data.load_llff import load_llff_data
 from tf_viewSyn.nerf.load_data.load_deepvoxels import load_dv_data
 from tf_viewSyn.nerf.load_data.load_blender import load_blender_data
-from tf_viewSyn.nerf.load_data.load_blmvs import load_blmvs_data
+#from tf_viewSyn.nerf.load_data.load_blmvs import load_blmvs_data
 
 from tf_viewSyn.nerf.build_graph_ray import *
 from tf_viewSyn.nerf.build_graph_patch import *
+from tf_viewSyn.nerf.build_graph_cascade import *
+from tf_viewSyn.nerf.build_graph_bg import *
 
 tf.compat.v1.enable_eager_execution()
-
 
 def config_parser():
 
@@ -149,6 +149,11 @@ def config_parser():
     parser.add_argument("--pr_patch_size", type=int, default=12,
                         help='frequency of render_poses video saving')
 
+    parser.add_argument("--flag_cascade", type=ast.literal_eval, default=False,
+                        help='frequency of render_poses video saving')
+    parser.add_argument("--flag_bg", type=ast.literal_eval, default=False,
+                        help='frequency of render_poses video saving')
+
     return parser
 
 """
@@ -165,6 +170,9 @@ python run_nerf.py --config ./cascade_config/LOCALconfig_city_temple.txt \
 python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern.txt --no_ndc --spherify --lindisp
 
 python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern_patchRay.txt --no_ndc --spherify --lindisp
+
+python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern_cascadeWin.txt --no_ndc --spherify --lindisp
+
 
 # 0 reproduce 2048
 bash
@@ -495,12 +503,43 @@ def train():
 
         #####  Core optimization loop  #####
         with tf.GradientTape() as tape:
-
             # Make predictions for color, disparity, accumulated opacity.
             if args.flag_patch_ray:
                 rgb, disp, acc, extras = render_patch(
                     H, W, focal, chunk=int(args.chunk / (args.pr_patch_size*args.pr_patch_size)), rays=batch_rays,
                     verbose=i < 10, retraw=True, pr_patch_size=args.pr_patch_size, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                loss = img_loss
+                psnr = mse2psnr(img_loss)
+
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+            elif args.flag_cascade:
+                rgb, disp, acc, extras = render_cascade(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                loss = img_loss
+                psnr = mse2psnr(img_loss)
+
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+            elif args.flag_bg:
+                rgb, disp, acc, extras = render_bg(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
 
                 # Compute MSE loss between predicted and true RGB.
                 img_loss = img2mse(rgb, target_s)

@@ -19,7 +19,7 @@ from skimage.metrics import structural_similarity as ssim
 
 #
 from tf_viewSyn.nerf.run_nerf_helpers import *
-from tf_viewSyn.nerf.build_graph_patch import render_patch
+from tf_viewSyn.nerf.build_graph_patch import *
 from baselib_python.Common.VisualError import pixel_error_heatmap
 
 def batchify(fn, chunk):
@@ -265,7 +265,7 @@ def batchify_rays(rays_flat, chunk=1024 * 32, **kwargs):
     return all_ret
 
 
-def render(H, W, focal,
+def render_bg(H, W, focal,
            chunk=1024 * 32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None,

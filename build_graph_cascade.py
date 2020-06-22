@@ -19,10 +19,9 @@ from skimage.metrics import structural_similarity as ssim
 
 #
 from tf_viewSyn.nerf.run_nerf_helpers import *
-from tf_viewSyn.nerf.build_graph_patch import render_patch
 from baselib_python.Common.VisualError import pixel_error_heatmap
 
-def batchify(fn, chunk):
+def batchify_cascade(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
     if chunk is None:
         return fn
@@ -33,7 +32,7 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64):
+def run_network_cascade(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64):
     """Prepares inputs and applies network 'fn'."""
 
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
@@ -45,24 +44,15 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = tf.concat([embedded, embedded_dirs], -1)
 
-    outputs_flat = batchify(fn, netchunk)(embedded)
+    outputs_flat = batchify_cascade(fn, netchunk)(embedded)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
 
-def render_rays(ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False):
+def render_rays_cascade(ray_batch, network_fn, network_query_fn,
+                        N_samples, retraw=False, lindisp=False, perturb=0., N_importance=0, network_fine=None,
+                        white_bkgd=False, raw_noise_std=0., verbose=False):
     """Volumetric rendering.
 
     Args:
@@ -132,6 +122,7 @@ def render_rays(ray_batch,
 
         # Extract RGB of each sample position along each ray.
         rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
+        tf.debugging.check_numerics(rgb, 'raw2outputs {}'.format('rgb'))
 
         # Add noise to model's predictions for density. Can be used to
         # regularize network during training (prevents floater artifacts).
@@ -142,6 +133,7 @@ def render_rays(ray_batch,
         # Predict density of each sample along each ray. Higher values imply
         # higher likelihood of being absorbed at this point.
         alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
+        tf.debugging.check_numerics(alpha, 'raw2outputs {}'.format('alpha'))
 
         # Compute weight for RGB of each sample along each ray.  A cumprod() is
         # used to express the idea of the ray not having reflected up to this
@@ -149,6 +141,7 @@ def render_rays(ray_batch,
         # [N_rays, N_samples]
         weights = alpha * \
                   tf.math.cumprod(1. - alpha + 1e-10, axis=-1, exclusive=True)
+        tf.debugging.check_numerics(weights, 'raw2outputs {}'.format('weights'))
 
         # Computed weighted color of each sample along each ray.
         rgb_map = tf.reduce_sum(
@@ -218,23 +211,43 @@ def render_rays(ray_batch,
     if N_importance > 0:
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
-        # Obtain additional integration times to evaluate based on the weights
-        # assigned to colors in the coarse model.
         z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
         z_samples = sample_pdf(
             z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.))
         z_samples = tf.stop_gradient(z_samples)
 
+        if 0:
+            # Obtain additional integration times to evaluate based on the weights
+            # assigned to colors in the coarse model.
+            z_vals = tf.sort(tf.concat([z_vals, z_samples], -1), -1)
+        else:
+            z_st = depth_map[:, None] - tf.abs(far-near)/N_samples/2.0
+            z_end = z_st + (far-near)/N_samples
+
+            fine_t_vals = tf.linspace(0., 1., N_importance)
+            if not lindisp:
+                # Space integration times linearly between 'near' and 'far'. Same
+                # integration points will be used for all rays.
+                z_vals = z_st * (1. - t_vals) + z_end * (fine_t_vals)
+            else:
+                # Sample linearly in inverse depth (disparity).
+                z_vals = 1. / (1. / z_st * (1. - fine_t_vals) + 1. / z_end * (fine_t_vals))
+            z_vals = tf.broadcast_to(z_vals, [N_rays, N_importance])
+            z_vals = tf.sort(z_vals, -1)
+
         # Obtain all points to evaluate color, density at.
-        z_vals = tf.sort(tf.concat([z_vals, z_samples], -1), -1)
         pts = rays_o[..., None, :] + rays_d[..., None, :] * \
                                      z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
+        tf.debugging.check_numerics(z_vals, 'output {}'.format('z_vals'))
+        tf.debugging.check_numerics(pts, 'output {}'.format('pts'))
+
 
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
+
 
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
     if retraw:
@@ -251,11 +264,11 @@ def render_rays(ray_batch,
     return ret
 
 
-def batchify_rays(rays_flat, chunk=1024 * 32, **kwargs):
+def batchify_rays_cascade(rays_flat, chunk=1024 * 32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i + chunk], **kwargs)
+        ret = render_rays_cascade(rays_flat[i:i + chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -265,7 +278,7 @@ def batchify_rays(rays_flat, chunk=1024 * 32, **kwargs):
     return all_ret
 
 
-def render(H, W, focal,
+def render_cascade(H, W, focal,
            chunk=1024 * 32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None,
@@ -333,7 +346,7 @@ def render(H, W, focal,
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays_cascade(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
