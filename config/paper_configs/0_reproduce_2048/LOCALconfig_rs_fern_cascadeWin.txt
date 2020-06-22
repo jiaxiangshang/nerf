@@ -29,3 +29,4 @@ i_video = 5001
 flag_patch_ray = False
 pr_patch_size = 4
 flag_cascade = True
+lrate = 1e-4

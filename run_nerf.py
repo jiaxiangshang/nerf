@@ -599,6 +599,9 @@ def train():
             if args.flag_patch_ray:
                 rgb, disp, acc, extras = render_patch(H, W, focal, chunk=int(args.chunk / (args.pr_patch_size*args.pr_patch_size)),
                                                       c2w=pose, pr_patch_size=args.pr_patch_size, **render_kwargs_test)
+            elif args.flag_cascade:
+                rgb, disp, acc, extras = render_cascade(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                        **render_kwargs_test)
             else:
                 rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
