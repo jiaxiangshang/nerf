@@ -55,10 +55,7 @@ def _minify(basedir, factors=[], resolutions=[]):
             check_output('rm {}/*.{}'.format(imgdir, ext), shell=True)
             print('Removed duplicates')
         print('Done')
-            
-        
-        
-        
+
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
@@ -97,7 +94,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
-    
+    poses_spe = np.moveaxis(poses, -1, 0).astype(np.float32)
+
     sh = imageio.imread(imgfiles[0]).shape
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
@@ -116,11 +114,6 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
     return poses, bds, imgs
-
-    
-            
-            
-    
 
 def normalize(x):
     return x / np.linalg.norm(x)
@@ -263,9 +256,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
         
     if spherify:
         poses, render_poses, bds = spherify_poses(poses, bds)
-
     else:
-        
         c2w = poses_avg(poses)
         print('recentered', c2w.shape)
         print(c2w[:3,:4])

@@ -53,7 +53,8 @@ class Embedder:
         self.out_dim = out_dim
 
     def embed(self, inputs):
-        return tf.concat([fn(inputs) for fn in self.embed_fns], -1)
+        pos_encode = tf.concat([fn(inputs) for fn in self.embed_fns], -1)
+        return pos_encode
 
 
 def get_embedder(multires, i=0):
@@ -76,14 +77,12 @@ def get_embedder(multires, i=0):
 
 
 # Model architecture
-
 def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
 
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
-    print('MODEL', input_ch, input_ch_views, type(
-        input_ch), type(input_ch_views), use_viewdirs)
+    print('MODEL', input_ch, input_ch_views, type(input_ch), type(input_ch_views), use_viewdirs)
     input_ch = int(input_ch)
     input_ch_views = int(input_ch_views)
 
@@ -117,9 +116,53 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     return model
 
+def init_nerf_model_attention(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False, patch_size=4):
+
+    relu = tf.keras.layers.ReLU()
+    def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
+
+    print('MODEL', input_ch, input_ch_views, type(
+        input_ch), type(input_ch_views), use_viewdirs)
+    input_ch = int(input_ch)
+    input_ch_views = int(input_ch_views)
+
+    inputs = tf.keras.Input(shape=(patch_size*patch_size, input_ch + input_ch_views))
+    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+    inputs_pts.set_shape([None, patch_size*patch_size, input_ch])
+    inputs_views.set_shape([None, patch_size*patch_size, input_ch_views])
+
+    print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+    outputs = inputs_pts
+    for i in range(D):
+        outputs = dense(W)(outputs)
+        if i in skips:
+            outputs = tf.concat([inputs_pts, outputs], -1)
+
+    if use_viewdirs:
+        alpha_out = dense(1, act=None)(outputs)
+        bottleneck = dense(256, act=None)(outputs)
+        inputs_viewdirs = tf.concat([bottleneck, inputs_views], -1)  # concat viewdirs
+        outputs = inputs_viewdirs
+
+        # attention
+        outputs_att = tf.keras.layers.Attention()(
+            [outputs, outputs])
+
+        outputs = tf.concat([outputs, outputs_att], -1)
+
+        # The supplement to the paper states there are 4 hidden layers here, but this is an error since
+        # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
+        for i in range(1):
+            outputs = dense(W//2)(outputs)
+        outputs = dense(3, act=None)(outputs)
+        outputs = tf.concat([outputs, alpha_out], -1)
+    else:
+        outputs = dense(output_ch, act=None)(outputs)
+
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    return model
 
 # Ray helpers
-
 def get_rays(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
     i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
@@ -139,6 +182,52 @@ def get_rays_np(H, W, focal, c2w):
     rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
     return rays_o, rays_d
 
+def get_patchRays(H, W, focal, c2w, pr_patch_size):
+    """Get ray origins, directions from a pinhole camera."""
+    i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
+                       tf.range(H, dtype=tf.float32), indexing='xy')
+    dirs = tf.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -tf.ones_like(i)], -1)
+    rays_d = tf.reduce_sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_o = tf.broadcast_to(c2w[:3, -1], tf.shape(rays_d))
+
+    rays_rgb = tf.stack([rays_o, rays_d], axis=-2)
+
+    list_pr = []
+    for i in range(int(H / pr_patch_size)):
+        for j in range(int(W / pr_patch_size)):
+            i_jump = i * pr_patch_size
+            j_jump = j * pr_patch_size
+            pr = rays_rgb[i_jump:i_jump + pr_patch_size, j_jump:j_jump + pr_patch_size, :, :]
+            list_pr.append(pr)
+    patchRays_rgb = tf.stack(list_pr, axis=0)  # [N, H * W / pr_patch_size^2, pr_patch_size^2, ro+rd+rgb, 3]
+
+    rays_o = patchRays_rgb[:, :, :, 0, :]
+    rays_d = patchRays_rgb[:, :, :, 1, :]
+
+    return rays_o, rays_d
+
+def get_patchRays_np(H, W, focal, c2w, pr_patch_size):
+    """Get ray origins, directions from a pinhole camera."""
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32),
+                       np.arange(H, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -np.ones_like(i)], -1)
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
+
+    rays_rgb = np.stack([rays_o, rays_d], axis=-2)
+
+    list_pr = []
+    for i in range(int(H / pr_patch_size)):
+        for j in range(int(W / pr_patch_size)):
+            i_jump = i * pr_patch_size
+            j_jump = j * pr_patch_size
+            pr = rays_rgb[:, i_jump:i_jump + pr_patch_size, j_jump:j_jump + pr_patch_size, :, :]
+            list_pr.append(pr)
+    patchRays_rgb = np.stack(list_pr, axis=1)  # [N, H * W / pr_patch_size^2, pr_patch_size^2, ro+rd+rgb, 3]
+
+    rays_o, rays_d = np.split(patchRays_rgb, axis=-2)
+
+    return rays_o, rays_d
 
 def ndc_rays(H, W, focal, near, rays_o, rays_d):
     """Normalized device coordinate rays.

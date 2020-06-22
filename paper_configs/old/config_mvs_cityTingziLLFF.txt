@@ -1,0 +1,16 @@
+expname = blmvs_tingziLLFF1_test
+basedir = ./logs
+datadir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/1_nerf_trying/city_tingzi/colmap_proj
+dataset_type = llff
+shape = city_tingzi
+
+factor = 1
+llffhold = 8
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
+

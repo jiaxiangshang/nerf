@@ -2,460 +2,28 @@ import os
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import sys
-import tensorflow as tf
-import numpy as np
-import imageio
-import json
-import random
+import ast
 import time
-from run_nerf_helpers import *
-from load_llff import load_llff_data
-from load_deepvoxels import load_dv_data
-from load_blender import load_blender_data
 
+
+#self
+_curr_path = os.path.abspath(__file__) # /home/..../face
+_cur_dir = os.path.dirname(_curr_path) # ./
+_tf_dir = os.path.dirname(_cur_dir) # ./
+_deep_learning_dir = os.path.dirname(_tf_dir) # ../
+print(_deep_learning_dir)
+sys.path.append(_deep_learning_dir) # /home/..../pytorch3d
+
+from tf_viewSyn.nerf.run_nerf_helpers import *
+from tf_viewSyn.nerf.load_data.load_llff import load_llff_data
+from tf_viewSyn.nerf.load_data.load_deepvoxels import load_dv_data
+from tf_viewSyn.nerf.load_data.load_blender import load_blender_data
+from tf_viewSyn.nerf.load_data.load_blmvs import load_blmvs_data
+
+from tf_viewSyn.nerf.build_graph_ray import *
+from tf_viewSyn.nerf.build_graph_patch import *
 
 tf.compat.v1.enable_eager_execution()
-
-
-def batchify(fn, chunk):
-    """Constructs a version of 'fn' that applies to smaller batches."""
-    if chunk is None:
-        return fn
-
-    def ret(inputs):
-        return tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
-    return ret
-
-
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'."""
-
-    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
-
-    embedded = embed_fn(inputs_flat)
-    if viewdirs is not None:
-        input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
-        input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = tf.concat([embedded, embedded_dirs], -1)
-
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = tf.reshape(outputs_flat, list(
-        inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
-
-
-def render_rays(ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False):
-    """Volumetric rendering.
-
-    Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
-
-    Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
-      rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
-    """
-
-    def raw2outputs(raw, z_vals, rays_d):
-        """Transforms model's predictions to semantically meaningful values.
-
-        Args:
-          raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-          z_vals: [num_rays, num_samples along ray]. Integration time.
-          rays_d: [num_rays, 3]. Direction of each ray.
-
-        Returns:
-          rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-          disp_map: [num_rays]. Disparity map. Inverse of depth map.
-          acc_map: [num_rays]. Sum of weights along each ray.
-          weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-          depth_map: [num_rays]. Estimated distance to object.
-        """
-        # Function for computing density from model prediction. This value is
-        # strictly between [0, 1].
-        def raw2alpha(raw, dists, act_fn=tf.nn.relu): return 1.0 - \
-            tf.exp(-act_fn(raw) * dists)
-
-        # Compute 'distance' (in time) between each integration time along a ray.
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-
-        # The 'distance' from the last integration time is infinity.
-        dists = tf.concat(
-            [dists, tf.broadcast_to([1e10], dists[..., :1].shape)],
-            axis=-1)  # [N_rays, N_samples]
-
-        # Multiply each distance by the norm of its corresponding direction ray
-        # to convert to real world distance (accounts for non-unit directions).
-        dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
-
-        # Extract RGB of each sample position along each ray.
-        rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
-
-        # Add noise to model's predictions for density. Can be used to 
-        # regularize network during training (prevents floater artifacts).
-        noise = 0.
-        if raw_noise_std > 0.:
-            noise = tf.random.normal(raw[..., 3].shape) * raw_noise_std
-
-        # Predict density of each sample along each ray. Higher values imply
-        # higher likelihood of being absorbed at this point.
-        alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
-
-        # Compute weight for RGB of each sample along each ray.  A cumprod() is
-        # used to express the idea of the ray not having reflected up to this
-        # sample yet.
-        # [N_rays, N_samples]
-        weights = alpha * \
-            tf.math.cumprod(1.-alpha + 1e-10, axis=-1, exclusive=True)
-
-        # Computed weighted color of each sample along each ray.
-        rgb_map = tf.reduce_sum(
-            weights[..., None] * rgb, axis=-2)  # [N_rays, 3]
-
-        # Estimated depth map is expected distance.
-        depth_map = tf.reduce_sum(weights * z_vals, axis=-1)
-
-        # Disparity map is inverse depth.
-        disp_map = 1./tf.maximum(1e-10, depth_map /
-                                 tf.reduce_sum(weights, axis=-1))
-
-        # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
-        acc_map = tf.reduce_sum(weights, -1)
-
-        # To composite onto a white background, use the accumulated alpha map.
-        if white_bkgd:
-            rgb_map = rgb_map + (1.-acc_map[..., None])
-
-        return rgb_map, disp_map, acc_map, weights, depth_map
-
-    ###############################
-    # batch size
-    N_rays = ray_batch.shape[0]
-
-    # Extract ray origin, direction.
-    rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
-
-    # Extract unit-normalized viewing direction.
-    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
-
-    # Extract lower, upper bound for ray distance.
-    bounds = tf.reshape(ray_batch[..., 6:8], [-1, 1, 2])
-    near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]
-
-    # Decide where to sample along each ray. Under the logic, all rays will be sampled at
-    # the same times.
-    t_vals = tf.linspace(0., 1., N_samples)
-    if not lindisp:
-        # Space integration times linearly between 'near' and 'far'. Same
-        # integration points will be used for all rays.
-        z_vals = near * (1.-t_vals) + far * (t_vals)
-    else:
-        # Sample linearly in inverse depth (disparity).
-        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-    z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
-
-    # Perturb sampling time along each ray.
-    if perturb > 0.:
-        # get intervals between samples
-        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        upper = tf.concat([mids, z_vals[..., -1:]], -1)
-        lower = tf.concat([z_vals[..., :1], mids], -1)
-        # stratified samples in those intervals
-        t_rand = tf.random.uniform(z_vals.shape)
-        z_vals = lower + (upper - lower) * t_rand
-
-    # Points in space to evaluate model at.
-    pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-        z_vals[..., :, None]  # [N_rays, N_samples, 3]
-
-    # Evaluate model at each point.
-    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-        raw, z_vals, rays_d)
-
-    if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
-
-        # Obtain additional integration times to evaluate based on the weights
-        # assigned to colors in the coarse model.
-        z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        z_samples = sample_pdf(
-            z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.))
-        z_samples = tf.stop_gradient(z_samples)
-
-        # Obtain all points to evaluate color, density at.
-        z_vals = tf.sort(tf.concat([z_vals, z_samples], -1), -1)
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-            z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
-
-        # Make predictions with network_fine.
-        run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn)
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, rays_d)
-
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
-    if retraw:
-        ret['raw'] = raw
-    if N_importance > 0:
-        ret['rgb0'] = rgb_map_0
-        ret['disp0'] = disp_map_0
-        ret['acc0'] = acc_map_0
-        ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
-
-    for k in ret:
-        tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
-
-    return ret
-
-
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
-    """Render rays in smaller minibatches to avoid OOM."""
-    all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
-        for k in ret:
-            if k not in all_ret:
-                all_ret[k] = []
-            all_ret[k].append(ret[k])
-
-    all_ret = {k: tf.concat(all_ret[k], 0) for k in all_ret}
-    return all_ret
-
-
-def render(H, W, focal,
-           chunk=1024*32, rays=None, c2w=None, ndc=True,
-           near=0., far=1.,
-           use_viewdirs=False, c2w_staticcam=None,
-           **kwargs):
-    """Render rays
-
-    Args:
-      H: int. Height of image in pixels.
-      W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
-      chunk: int. Maximum number of rays to process simultaneously. Used to
-        control maximum memory usage. Does not affect final results.
-      rays: array of shape [2, batch_size, 3]. Ray origin and direction for
-        each example in batch.
-      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
-      ndc: bool. If True, represent ray origin, direction in NDC coordinates.
-      near: float or array of shape [batch_size]. Nearest distance for a ray.
-      far: float or array of shape [batch_size]. Farthest distance for a ray.
-      use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
-       camera while using other c2w argument for viewing directions.
-
-    Returns:
-      rgb_map: [batch_size, 3]. Predicted RGB values for rays.
-      disp_map: [batch_size]. Disparity map. Inverse of depth.
-      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
-      extras: dict with everything returned by render_rays().
-    """
-
-    if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(H, W, focal, c2w)
-    else:
-        # use provided ray batch
-        rays_o, rays_d = rays
-
-    if use_viewdirs:
-        # provide ray directions as input
-        viewdirs = rays_d
-        if c2w_staticcam is not None:
-            # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam)
-
-        # Make all directions unit magnitude.
-        # shape: [batch_size, 3]
-        viewdirs = viewdirs / tf.linalg.norm(viewdirs, axis=-1, keepdims=True)
-        viewdirs = tf.cast(tf.reshape(viewdirs, [-1, 3]), dtype=tf.float32)
-
-    sh = rays_d.shape  # [..., 3]
-    if ndc:
-        # for forward facing scenes
-        rays_o, rays_d = ndc_rays(
-            H, W, focal, tf.cast(1., tf.float32), rays_o, rays_d)
-
-    # Create ray batch
-    rays_o = tf.cast(tf.reshape(rays_o, [-1, 3]), dtype=tf.float32)
-    rays_d = tf.cast(tf.reshape(rays_d, [-1, 3]), dtype=tf.float32)
-    near, far = near * \
-        tf.ones_like(rays_d[..., :1]), far * tf.ones_like(rays_d[..., :1])
-
-    # (ray origin, ray direction, min dist, max dist) for each ray
-    rays = tf.concat([rays_o, rays_d, near, far], axis=-1)
-    if use_viewdirs:
-        # (ray origin, ray direction, min dist, max dist, normalized viewing direction)
-        rays = tf.concat([rays, viewdirs], axis=-1)
-
-    # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
-    for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = tf.reshape(all_ret[k], k_sh)
-
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
-    return ret_list + [ret_dict]
-
-
-def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
-
-    H, W, focal = hwf
-
-    if render_factor != 0:
-        # Render downsampled for speed
-        H = H//render_factor
-        W = W//render_factor
-        focal = focal/render_factor
-
-    rgbs = []
-    disps = []
-
-    t = time.time()
-    for i, c2w in enumerate(render_poses):
-        print(i, time.time() - t)
-        t = time.time()
-        rgb, disp, acc, _ = render(
-            H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
-        rgbs.append(rgb.numpy())
-        disps.append(disp.numpy())
-        if i == 0:
-            print(rgb.shape, disp.shape)
-
-        if gt_imgs is not None and render_factor == 0:
-            p = -10. * np.log10(np.mean(np.square(rgb - gt_imgs[i])))
-            print(p)
-
-        if savedir is not None:
-            rgb8 = to8b(rgbs[-1])
-            filename = os.path.join(savedir, '{:03d}.png'.format(i))
-            imageio.imwrite(filename, rgb8)
-
-    rgbs = np.stack(rgbs, 0)
-    disps = np.stack(disps, 0)
-
-    return rgbs, disps
-
-
-def create_nerf(args):
-    """Instantiate NeRF's MLP model."""
-
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
-
-    input_ch_views = 0
-    embeddirs_fn = None
-    if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(
-            args.multires_views, args.i_embed)
-    output_ch = 4
-    skips = [4]
-    model = init_nerf_model(
-        D=args.netdepth, W=args.netwidth,
-        input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-    grad_vars = model.trainable_variables
-    models = {'model': model}
-
-    model_fine = None
-    if args.N_importance > 0:
-        model_fine = init_nerf_model(
-            D=args.netdepth_fine, W=args.netwidth_fine,
-            input_ch=input_ch, output_ch=output_ch, skips=skips,
-            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-        grad_vars += model_fine.trainable_variables
-        models['model_fine'] = model_fine
-
-    def network_query_fn(inputs, viewdirs, network_fn): return run_network(
-        inputs, viewdirs, network_fn,
-        embed_fn=embed_fn,
-        embeddirs_fn=embeddirs_fn,
-        netchunk=args.netchunk)
-
-    render_kwargs_train = {
-        'network_query_fn': network_query_fn,
-        'perturb': args.perturb,
-        'N_importance': args.N_importance,
-        'network_fine': model_fine,
-        'N_samples': args.N_samples,
-        'network_fn': model,
-        'use_viewdirs': args.use_viewdirs,
-        'white_bkgd': args.white_bkgd,
-        'raw_noise_std': args.raw_noise_std,
-    }
-
-    # NDC only good for LLFF-style forward facing data
-    if args.dataset_type != 'llff' or args.no_ndc:
-        print('Not ndc!')
-        render_kwargs_train['ndc'] = False
-        render_kwargs_train['lindisp'] = args.lindisp
-
-    render_kwargs_test = {
-        k: render_kwargs_train[k] for k in render_kwargs_train}
-    render_kwargs_test['perturb'] = False
-    render_kwargs_test['raw_noise_std'] = 0.
-
-    start = 0
-    basedir = args.basedir
-    expname = args.expname
-
-    if args.ft_path is not None and args.ft_path != 'None':
-        ckpts = [args.ft_path]
-    else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
-                 ('model_' in f and 'fine' not in f and 'optimizer' not in f)]
-    print('Found ckpts', ckpts)
-    if len(ckpts) > 0 and not args.no_reload:
-        ft_weights = ckpts[-1]
-        print('Reloading from', ft_weights)
-        model.set_weights(np.load(ft_weights, allow_pickle=True))
-        start = int(ft_weights[-10:-4]) + 1
-        print('Resetting step to', start)
-
-        if model_fine is not None:
-            ft_weights_fine = '{}_fine_{}'.format(
-                ft_weights[:-11], ft_weights[-10:])
-            print('Reloading fine from', ft_weights_fine)
-            model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
-
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, models
 
 
 def config_parser():
@@ -470,7 +38,7 @@ def config_parser():
     parser.add_argument("--datadir", type=str,
                         default='./data/llff/fern', help='input data directory')
 
-    # training options
+    # training options: net design
     parser.add_argument("--netdepth", type=int, default=8,
                         help='layers in network')
     parser.add_argument("--netwidth", type=int, default=256,
@@ -479,16 +47,21 @@ def config_parser():
                         default=8, help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256,
                         help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=32*32*4,
+
+    # training options: lr
+    parser.add_argument("--max_global_steps", type=int, default=1000000,
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float,
                         default=5e-4, help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250,
                         help='exponential learning rate decay (in 1000s)')
+    # training options: ray sample
+    parser.add_argument("--N_rand", type=int, default=32*32*4,
+                        help='batch size (number of random rays per gradient step)')
     parser.add_argument("--chunk", type=int, default=1024*32,
-                        help='number of rays processed in parallel, decrease if running out of memory')
+                        help='number of rays processed in parallel, decrease if running out of memory, (2 min than nerf)')
     parser.add_argument("--netchunk", type=int, default=1024*64,
-                        help='number of pts sent through network in parallel, decrease if running out of memory')
+                        help='number of pts sent through network in parallel, decrease if running out of memory (2 min than nerf)')
     parser.add_argument("--no_batching", action='store_true',
                         help='only take random rays from 1 image at a time')
     parser.add_argument("--no_reload", action='store_true',
@@ -522,6 +95,7 @@ def config_parser():
     parser.add_argument("--raw_noise_std", type=float, default=0.,
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
 
+    #
     parser.add_argument("--render_only", action='store_true',
                         help='do not optimize, reload weights and render out render_poses path')
     parser.add_argument("--render_test", action='store_true',
@@ -531,7 +105,7 @@ def config_parser():
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff',
-                        help='options: llff / blender / deepvoxels')
+                        help='options: llff / blender / deepvoxels / blmvs')
     parser.add_argument("--testskip", type=int, default=8,
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
 
@@ -562,28 +136,92 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500,
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=10000,
+    parser.add_argument("--i_weights", type=int, default=50000,
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
+    # jiaxiang
+    parser.add_argument("--flag_patch_ray", type=ast.literal_eval, default=False,
+                        help='frequency of render_poses video saving')
+    parser.add_argument("--pr_patch_size", type=int, default=12,
+                        help='frequency of render_poses video saving')
+
     return parser
 
+"""
+python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_lib.txt \
+--no_ndc --spherify --lindisp
 
+# debug
+python run_nerf.py --config ./cascade_config/config_debug.txt \
+--no_ndc --spherify --lindisp
+
+python run_nerf.py --config ./cascade_config/LOCALconfig_city_temple.txt \
+--no_ndc --spherify --lindisp
+
+python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern.txt --no_ndc --spherify --lindisp
+
+python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern_patchRay.txt --no_ndc --spherify --lindisp
+
+# 0 reproduce 2048
+bash
+
+# 1 patch 2048
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./config/paper_configs/1_patch_2048/config0_patch_fern.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./config/paper_configs/1_patch_2048/config4_patch_leaves.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config ./config/paper_configs/1_patch_2048/config4_patch12_leaves.txt \
+--no_ndc --spherify --lindisp
+
+
+# 8-card
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_lib.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_tingzi.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_ball.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_bread.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=6 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_camera.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=7 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_gate.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=0 python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_yunnan.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=1 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_car.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_rock.txt \
+--no_ndc --spherify --lindisp
+
+
+"""
 def train():
 
     parser = config_parser()
     args = parser.parse_args()
-    
+
+    # Random seed
     if args.random_seed is not None:
         print('Fixing random seed', args.random_seed)
         np.random.seed(args.random_seed)
         tf.compat.v1.set_random_seed(args.random_seed)
 
     # Load data
-
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
@@ -611,7 +249,6 @@ def train():
             near = 0.
             far = 1.
         print('NEAR FAR', near, far)
-
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
             args.datadir, args.half_res, args.testskip)
@@ -626,7 +263,6 @@ def train():
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
         else:
             images = images[..., :3]
-
     elif args.dataset_type == 'deepvoxels':
 
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
@@ -640,7 +276,17 @@ def train():
         hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
         near = hemi_R-1.
         far = hemi_R+1.
-
+    elif args.dataset_type == 'blmvs':
+        images, poses, render_poses, hwf, i_split, stk_depth_min, stk_depth_max = load_blmvs_data(
+            scene=args.shape, basedir=args.datadir, interv=args.testskip
+        )
+        poses = poses[:, :3, :4]
+        print('Loaded blmvs', images.shape, render_poses.shape, hwf, args.datadir)
+        #
+        i_train, i_val, i_test = i_split
+        #
+        near = stk_depth_min-10.
+        far = stk_depth_max+10.
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -666,10 +312,14 @@ def train():
         f = os.path.join(basedir, expname, 'config.txt')
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
+    path_f_eval = os.path.join(basedir, expname, 'eval.txt')
+    f_eval = open(path_f_eval, 'w')
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
-        args)
+    if args.flag_patch_ray:
+        render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf_patch(args)
+    else:
+        render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(args)
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
@@ -704,8 +354,9 @@ def train():
     # Create optimizer
     lrate = args.lrate
     if args.lrate_decay > 0:
-        lrate = tf.keras.optimizers.schedules.ExponentialDecay(lrate,
-                                                               decay_steps=args.lrate_decay * 1000, decay_rate=0.1)
+        lrate = tf.keras.optimizers.schedules.ExponentialDecay(
+            lrate, decay_steps=args.lrate_decay * 1000, decay_rate=0.1
+        )
     optimizer = tf.keras.optimizers.Adam(lrate)
     models['optimizer'] = optimizer
 
@@ -714,65 +365,105 @@ def train():
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
+    pr_N_rand = int(args.N_rand / (args.pr_patch_size*args.pr_patch_size))
+
     use_batching = not args.no_batching
     if use_batching:
-        # For random ray batching.
-        #
-        # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
-        # interpreted as,
-        #   axis=0: ray origin in world space
-        #   axis=1: ray direction in world space
-        #   axis=2: observed RGB color of pixel
-        print('get rays')
-        # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
-        # for each pixel in the image. This stack() adds a new dimension.
-        rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
-        print('done, concats')
-        # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
-        # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = np.stack([rays_rgb[i]
-                             for i in i_train], axis=0)  # train images only
-        # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
-        rays_rgb = rays_rgb.astype(np.float32)
-        print('shuffle rays')
-        np.random.shuffle(rays_rgb)
-        print('done')
-        i_batch = 0
+        if args.flag_patch_ray:
+            rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+            rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
+            print('Prepare raybatch tensor: 0. generate rays(finish)')
+            # [N, ro+rd+rgb, H, W, 3]
+            rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+            # [N, H, W, ro+rd+rgb, 3]
+            rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+            rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
+            print('Prepare raybatch tensor: 1. concat image and select training set(finish)')
 
-    N_iters = 1000000
+            list_pr = []
+            for i in range(int(H / args.pr_patch_size)):
+                for j in range(int(W / args.pr_patch_size)):
+                    i_jump = i * args.pr_patch_size
+                    j_jump = j * args.pr_patch_size
+                    pr = rays_rgb[:, i_jump:i_jump+args.pr_patch_size, j_jump:j_jump+args.pr_patch_size, :, :]
+                    list_pr.append(pr)
+            patchRays_rgb = np.stack(list_pr, axis=1) # [N, H * W / pr_patch_size^2, pr_patch_size^2, ro+rd+rgb, 3]
+            print('Prepare patchRaybatch tensor: 2. generate patch(finish)')
+
+
+            # flat: [(N-1)*H*W, ro+rd+rgb, 3]
+            rays_rgb = np.reshape(patchRays_rgb, [-1, args.pr_patch_size, args.pr_patch_size, 3, 3])
+            rays_rgb = rays_rgb.astype(np.float32)
+
+            np.random.shuffle(rays_rgb)
+            print('Prepare raybatch tensor: 3. shuffle training set(finish)')
+            i_batch = 0
+        else:
+            # For random ray batching.
+            #
+            # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
+            # interpreted as,
+            #   axis=0: ray origin in world space
+            #   axis=1: ray direction in world space
+            #   axis=2: observed RGB color of pixel
+            # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
+            # for each pixel in the image. This stack() adds a new dimension.
+            rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+            rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
+            print('Prepare raybatch tensor: 0. generate rays(finish)')
+            # [N, ro+rd+rgb, H, W, 3]
+            rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+            # [N, H, W, ro+rd+rgb, 3]
+            rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+            rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
+            print('Prepare raybatch tensor: 0. concat image and select training set(finish)')
+            # [(N-1)*H*W, ro+rd+rgb, 3]
+            rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+            rays_rgb = rays_rgb.astype(np.float32)
+            np.random.shuffle(rays_rgb)
+            print('Prepare raybatch tensor: 0. shuffle training set(finish)')
+            i_batch = 0
+
+    N_iters = args.max_global_steps
+    #N_iters = 5000
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
     # Summary writers
-    writer = tf.contrib.summary.create_file_writer(
-        os.path.join(basedir, 'summaries', expname))
+    writer = tf.contrib.summary.create_file_writer(os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
 
     for i in range(start, N_iters):
         time0 = time.time()
 
         # Sample random ray batch
-
         if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
-            batch = tf.transpose(batch, [1, 0, 2])
+            if args.flag_patch_ray:
+                # Random over all images
+                batch = rays_rgb[i_batch:i_batch+pr_N_rand]  # [B, 2+1, 3*?]
+                batch = tf.transpose(batch, [3, 0, 1, 2, 4])
 
-            # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
-            # target_s[n, rgb] = example_id, observed color.
-            batch_rays, target_s = batch[:2], batch[2]
+                # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
+                # target_s[n, rgb] = example_id, observed color.
+                batch_rays, target_s = batch[:2], batch[2]
 
-            i_batch += N_rand
+                i_batch += pr_N_rand
+            else:
+                # Random over all images
+                batch = rays_rgb[i_batch:i_batch + N_rand]  # [B, 2+1, 3*?]
+                batch = tf.transpose(batch, [1, 0, 2])
+
+                # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
+                # target_s[n, rgb] = example_id, observed color.
+                batch_rays, target_s = batch[:2], batch[2]
+
+                i_batch += N_rand
+
             if i_batch >= rays_rgb.shape[0]:
                 np.random.shuffle(rays_rgb)
                 i_batch = 0
-
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
@@ -803,25 +494,41 @@ def train():
                 target_s = tf.gather_nd(target, select_inds)
 
         #####  Core optimization loop  #####
-
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
-            rgb, disp, acc, extras = render(
-                H, W, focal, chunk=args.chunk, rays=batch_rays,
-                verbose=i < 10, retraw=True, **render_kwargs_train)
+            if args.flag_patch_ray:
+                rgb, disp, acc, extras = render_patch(
+                    H, W, focal, chunk=int(args.chunk / (args.pr_patch_size*args.pr_patch_size)), rays=batch_rays,
+                    verbose=i < 10, retraw=True, pr_patch_size=args.pr_patch_size, **render_kwargs_train)
 
-            # Compute MSE loss between predicted and true RGB.
-            img_loss = img2mse(rgb, target_s)
-            trans = extras['raw'][..., -1]
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
+                # Compute MSE loss between predicted and true RGB.
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                loss = img_loss
+                psnr = mse2psnr(img_loss)
 
-            # Add MSE loss for coarse-grained model
-            if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
-                loss += img_loss0
-                psnr0 = mse2psnr(img_loss0)
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+            else:
+                rgb, disp, acc, extras = render(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                loss = img_loss
+                psnr = mse2psnr(img_loss)
+
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
 
         gradients = tape.gradient(loss, grad_vars)
         optimizer.apply_gradients(zip(gradients, grad_vars))
@@ -829,23 +536,71 @@ def train():
         dt = time.time()-time0
 
         #####           end            #####
-
         # Rest is logging
-
         def save_weights(net, prefix, i):
             path = os.path.join(
                 basedir, expname, '{}_{:06d}.npy'.format(prefix, i))
             np.save(path, net.get_weights())
             print('saved weights at', path)
 
+        if i % args.i_print == 0 or i < 10:
+            print('Exp({:s}) | Iter({:d}) / Time({:.05f}) / psnr({:.05f}) / loss({:.05f})'.format(expname, global_step.numpy(), dt, psnr.numpy(), loss.numpy()))
+            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
+                tf.contrib.summary.scalar('loss', loss)
+                tf.contrib.summary.scalar('psnr', psnr)
+                tf.contrib.summary.histogram('tran', trans)
+                if args.N_importance > 0:
+                    tf.contrib.summary.scalar('psnr0', psnr0)
+
+        if i % args.i_img == 0:
+            # Log a rendered validation view to Tensorboard
+            img_i = np.random.choice(i_val)
+            target = images[img_i]
+            pose = poses[img_i, :3, :4]
+            if args.flag_patch_ray:
+                rgb, disp, acc, extras = render_patch(H, W, focal, chunk=int(args.chunk / (args.pr_patch_size*args.pr_patch_size)),
+                                                      c2w=pose, pr_patch_size=args.pr_patch_size, **render_kwargs_test)
+            else:
+                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                **render_kwargs_test)
+
+            psnr = mse2psnr(img2mse(rgb, target))
+
+            # Save out the validation image for Tensorboard-free monitoring
+            testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
+            if i == 0:
+                os.makedirs(testimgdir, exist_ok=True)
+            imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
+
+            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+
+                tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
+                tf.contrib.summary.image('disp', disp[tf.newaxis, ..., tf.newaxis])
+                tf.contrib.summary.image('acc', acc[tf.newaxis, ..., tf.newaxis])
+                tf.contrib.summary.scalar('psnr_holdout', psnr)
+                tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+
+            if args.N_importance > 0:
+                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                    tf.contrib.summary.image(
+                        'rgb0', to8b(extras['rgb0'])[tf.newaxis])
+                    tf.contrib.summary.image(
+                        'disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
+                    tf.contrib.summary.image(
+                        'z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
+
         if i % args.i_weights == 0:
             for k in models:
                 save_weights(models[k], k, i)
 
         if i % args.i_video == 0 and i > 0:
+            if args.flag_patch_ray:
+                rgbs, disps = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test, pr_patch_size=args.pr_patch_size)
+            else:
+                rgbs, disps = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test)
 
-            rgbs, disps = render_path(
-                render_poses, hwf, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
@@ -856,8 +611,12 @@ def train():
 
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
-                rgbs_still, _ = render_path(
-                    render_poses, hwf, args.chunk, render_kwargs_test)
+                if args.flag_patch_ray:
+                    rgbs_still, _ = render_path(
+                        render_poses, hwf, args.chunk, render_kwargs_test, pr_patch_size=args.pr_patch_size)
+                else:
+                    rgbs_still, _ = render_path(
+                        render_poses, hwf, args.chunk, render_kwargs_test)
                 render_kwargs_test['c2w_staticcam'] = None
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
                                  to8b(rgbs_still), fps=30, quality=8)
@@ -866,60 +625,14 @@ def train():
             testsavedir = os.path.join(
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[i_test].shape)
-            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
-                        gt_imgs=images[i_test], savedir=testsavedir)
-            print('Saved test set')
+            print('TEST: test poses shape', poses[i_test].shape)
+            if args.flag_patch_ray:
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i)
+            else:
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test],
+                            savedir=testsavedir, iter=i, pr_patch_size=args.pr_patch_size)
+            print('TEST: saved test set')
 
-        if i % args.i_print == 0 or i < 10:
-
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
-
-            if i % args.i_img == 0:
-
-                # Log a rendered validation view to Tensorboard
-                img_i = np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3, :4]
-
-                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                **render_kwargs_test)
-
-                psnr = mse2psnr(img2mse(rgb, target))
-                
-                # Save out the validation image for Tensorboard-free monitoring
-                testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
-                if i==0:
-                    os.makedirs(testimgdir, exist_ok=True)
-                imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image(
-                        'disp', disp[tf.newaxis, ..., tf.newaxis])
-                    tf.contrib.summary.image(
-                        'acc', acc[tf.newaxis, ..., tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image(
-                            'rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image(
-                            'disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
-                        tf.contrib.summary.image(
-                            'z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
 
         global_step.assign_add(1)
 

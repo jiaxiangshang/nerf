@@ -1,0 +1,30 @@
+# This replicates the paper result for "Fern"
+# when trained to 200k iters. Settings are the 
+# same for all other LLFF-style real scenes.
+
+expname = rs_paper_fern_patchRay
+basedir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/0_nerf_origin/logs_0_nerf_llff_data
+datadir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/0_nerf_origin/0_nerf_llff_data/fern
+dataset_type = llff
+factor = 4
+llffhold = 8
+
+no_batching = False
+
+use_viewdirs = True
+lrate_decay = 250
+raw_noise_std = 1.0
+
+N_samples = 64
+N_importance = 128
+N_rand = 512
+
+max_global_steps = 601
+chunk = 16000
+i_print = 10
+i_img = 500
+i_testset = 500
+i_video = 501
+
+flag_patch_ray = True
+pr_patch_size = 4
