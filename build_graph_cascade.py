@@ -52,7 +52,7 @@ def run_network_cascade(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1
 
 def render_rays_cascade(ray_batch, network_fn, network_query_fn,
                         N_samples, retraw=False, lindisp=False, perturb=0., N_importance=0, network_fine=None,
-                        white_bkgd=False, raw_noise_std=0., verbose=False):
+                        white_bkgd=False, raw_noise_std=0., verbose=False, flag_infinite_last=True):
     """Volumetric rendering.
 
     Args:
@@ -86,7 +86,7 @@ def render_rays_cascade(ray_batch, network_fn, network_query_fn,
         sample.
     """
 
-    def raw2outputs(raw, z_vals, rays_d):
+    def raw2outputs(raw, z_vals, rays_d, coarse=None):
         """Transforms model's predictions to semantically meaningful values.
 
         Args:
@@ -105,16 +105,16 @@ def render_rays_cascade(ray_batch, network_fn, network_query_fn,
         # Function for computing density from model prediction. This value is
         # strictly between [0, 1].
         def raw2alpha(raw, dists, act_fn=tf.nn.relu):
-            return 1.0 - \
-                   tf.exp(-act_fn(raw) * dists)
+            return 1.0 - tf.exp(-act_fn(raw) * dists)
 
         # Compute 'distance' (in time) between each integration time along a ray.
         dists = z_vals[..., 1:] - z_vals[..., :-1]
 
         # The 'distance' from the last integration time is infinity.
-        dists = tf.concat(
-            [dists, tf.broadcast_to([1e10], dists[..., :1].shape)],
-            axis=-1)  # [N_rays, N_samples]
+        if flag_infinite_last:
+            dists = tf.concat([dists, tf.broadcast_to([1e10], dists[..., :1].shape)], axis=-1)  # [N_rays, N_samples]
+        else:
+            dists = tf.concat([dists, dists[:, -1:]], axis=-1)  # [N_rays, N_samples]
 
         # Multiply each distance by the norm of its corresponding direction ray
         # to convert to real world distance (accounts for non-unit directions).
@@ -161,7 +161,7 @@ def render_rays_cascade(ray_batch, network_fn, network_query_fn,
         if white_bkgd:
             rgb_map = rgb_map + (1. - acc_map[..., None])
 
-        return rgb_map, disp_map, acc_map, weights, depth_map
+        return rgb_map, disp_map, acc_map, weights, depth_map, alpha
 
     ###############################
     # batch size
@@ -205,11 +205,11 @@ def render_rays_cascade(ray_batch, network_fn, network_query_fn,
 
     # Evaluate model at each point.
     raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-        raw, z_vals, rays_d)
+    rgb_map, disp_map, acc_map, weights, depth_map_coarse, alpha = raw2outputs(
+        raw, z_vals, rays_d, coarse=True)
 
     if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0, alpha_0 = rgb_map, disp_map, acc_map, alpha
 
         z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
         z_samples = sample_pdf(
@@ -221,17 +221,17 @@ def render_rays_cascade(ray_batch, network_fn, network_query_fn,
             # assigned to colors in the coarse model.
             z_vals = tf.sort(tf.concat([z_vals, z_samples], -1), -1)
         else:
-            z_st = depth_map[:, None] - tf.abs(far-near)/N_samples/2.0
-            z_end = z_st + (far-near)/N_samples
+            z_st = depth_map_coarse[:, None] - tf.abs(far-near)/(N_samples*2)/2.0
+            z_end = z_st + tf.abs(far-near)/(N_samples*2)
 
-            fine_t_vals = tf.linspace(0., 1., N_importance)
+            fine_t_vals = tf.linspace(0., 1.0, N_importance)
             if not lindisp:
                 # Space integration times linearly between 'near' and 'far'. Same
                 # integration points will be used for all rays.
-                z_vals = z_st * (1. - t_vals) + z_end * (fine_t_vals)
+                z_vals = z_st * (1. - fine_t_vals) + z_end * (fine_t_vals)
             else:
                 # Sample linearly in inverse depth (disparity).
-                z_vals = 1. / (1. / z_st * (1. - fine_t_vals) + 1. / z_end * (fine_t_vals))
+                z_vals = 1. / (1. / (z_st+1e-6) * (1. - fine_t_vals) + 1. / (z_end+1e-6) * (fine_t_vals) +1e-6)
             z_vals = tf.broadcast_to(z_vals, [N_rays, N_importance])
             z_vals = tf.sort(z_vals, -1)
 
@@ -241,21 +241,23 @@ def render_rays_cascade(ray_batch, network_fn, network_query_fn,
         tf.debugging.check_numerics(z_vals, 'output {}'.format('z_vals'))
         tf.debugging.check_numerics(pts, 'output {}'.format('pts'))
 
-
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, rays_d)
+        rgb_map, disp_map, acc_map, weights, depth_map_fine, alpha = raw2outputs(
+            raw, z_vals, rays_d, coarse=False)
 
+        #depth_map_final = depth_map_coarse + depth_map_fine
+        disp_map_final = 1. / tf.maximum(1e-10, depth_map_fine / tf.reduce_sum(weights, axis=-1))
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map_final, 'acc_map': acc_map, 'alpha': alpha}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
+        ret['alpha_0'] = alpha_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
 
     for k in ret:
@@ -281,7 +283,7 @@ def batchify_rays_cascade(rays_flat, chunk=1024 * 32, **kwargs):
 def render_cascade(H, W, focal,
            chunk=1024 * 32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
-           use_viewdirs=False, c2w_staticcam=None,
+           use_viewdirs=False, c2w_staticcam=None, flag_infinite_last=True,
            **kwargs):
     """Render rays
 
@@ -355,168 +357,3 @@ def render_cascade(H, W, focal,
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
-
-
-def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, iter=None, pr_patch_size=None):
-    H, W, focal = hwf
-
-    if render_factor != 0:
-        # Render downsampled for speed
-        H = H // render_factor
-        W = W // render_factor
-        focal = focal / render_factor
-
-    if iter is not None:
-        f_eval = open(os.path.join(savedir, 'eval.txt'), 'w')
-
-    rgbs = []
-    disps = []
-
-    list_psnr_error = []
-    list_ssim_error = []
-
-    t_st = time.time()
-    for i, c2w in enumerate(render_poses):
-        print("Render_path", i, time.time() - t_st)
-        if pr_patch_size is not None:
-            rgb, disp, acc, extras = render_patch(H, W, focal,
-                                                  chunk=int(chunk / (pr_patch_size * pr_patch_size)),
-                                                  c2w=c2w[:3, :4], pr_patch_size=pr_patch_size, **render_kwargs)
-        else:
-            rgb, disp, acc, _ = render(
-                H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
-        rgbs.append(rgb.numpy())
-        disps.append(disp.numpy())
-        if i == 0:
-            print(rgb.shape, disp.shape)
-
-        if gt_imgs is not None and render_factor == 0:
-            # 0. MSE
-            mse_pure = np.mean(np.square(rgb - gt_imgs[i]), axis=2)
-            #print('Debug: ', mse_pure.shape, mse_pure.min(), mse_pure.max())
-            v_mse_pure = pixel_error_heatmap(mse_pure)[0]
-            #print('Debug: ', v_mse_pure.shape, v_mse_pure.min(), v_mse_pure.max())
-
-            psnr_pure = -10. * np.log10(mse_pure)
-            v_psnr_pure = pixel_error_heatmap(psnr_pure)[0]
-
-            psnr_error = np.mean(psnr_pure)
-            list_psnr_error.append(psnr_error)
-
-            rgb8 = to8b(v_mse_pure)
-            filename_mse = os.path.join(savedir, '{:03d}_mse.png'.format(i))
-            imageio.imwrite(filename_mse, rgb8)
-
-            rgb8 = to8b(v_psnr_pure)
-            filename_psnr = os.path.join(savedir, '{:03d}_psnr.png'.format(i))
-            imageio.imwrite(filename_psnr, rgb8)
-            # print("     Save test image: ", filename_mse)
-
-            # 1. SSIM
-            ssim_none = ssim(np.array(rgb), np.array(gt_imgs[i]), data_range=gt_imgs[i].max() - gt_imgs[i].min(), win_size=3, multichannel=True)
-            list_ssim_error.append(ssim_none)
-
-            if iter is not None:
-                f_eval.write('Iter %d: psnr error=%.3f, ssim error=%.3f\n' % (iter, psnr_error, ssim_none))
-                #print('Iter %d: psnr error=%.3f, ssim error=%.3f\n' % (iter, psnr_error, ssim_none))
-
-        if savedir is not None:
-            rgb8 = to8b(rgbs[-1])
-            filename = os.path.join(savedir, '{:03d}.png'.format(i))
-            imageio.imwrite(filename, rgb8)
-    np_list_psnr_error = np.array(list_psnr_error)
-    np_list_ssim_error = np.array(list_ssim_error)
-    if iter is not None:
-        f_eval.write('Finally aver: psnr error=%.3f, ssim error=%.3f\n' % (np.mean(np_list_psnr_error), np.mean(np_list_ssim_error)))
-        t_end = time.time()
-        f_eval.write('Testing time=%.3f\n' % (t_end-t_st))
-        f_eval.close()
-
-    rgbs = np.stack(rgbs, 0)
-    disps = np.stack(disps, 0)
-
-    return rgbs, disps
-
-
-def create_nerf(args):
-    """Instantiate NeRF's MLP model."""
-
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
-
-    input_ch_views = 0
-    embeddirs_fn = None
-    if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(
-            args.multires_views, args.i_embed)
-    output_ch = 4
-    skips = [4]
-    model = init_nerf_model(
-        D=args.netdepth, W=args.netwidth,
-        input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-    grad_vars = model.trainable_variables
-    models = {'model': model}
-
-    model_fine = None
-    if args.N_importance > 0:
-        model_fine = init_nerf_model(
-            D=args.netdepth_fine, W=args.netwidth_fine,
-            input_ch=input_ch, output_ch=output_ch, skips=skips,
-            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-        grad_vars += model_fine.trainable_variables
-        models['model_fine'] = model_fine
-
-    def network_query_fn(inputs, viewdirs, network_fn):
-        return run_network(
-            inputs, viewdirs, network_fn,
-            embed_fn=embed_fn,
-            embeddirs_fn=embeddirs_fn,
-            netchunk=args.netchunk)
-
-    render_kwargs_train = {
-        'network_query_fn': network_query_fn,
-        'perturb': args.perturb,
-        'N_importance': args.N_importance,
-        'network_fine': model_fine,
-        'N_samples': args.N_samples,
-        'network_fn': model,
-        'use_viewdirs': args.use_viewdirs,
-        'white_bkgd': args.white_bkgd,
-        'raw_noise_std': args.raw_noise_std,
-    }
-
-    # NDC only good for LLFF-style forward facing data
-    if args.dataset_type != 'llff' or args.no_ndc:
-        print('Not ndc!')
-        render_kwargs_train['ndc'] = False
-        render_kwargs_train['lindisp'] = args.lindisp
-
-    render_kwargs_test = {
-        k: render_kwargs_train[k] for k in render_kwargs_train}
-    render_kwargs_test['perturb'] = False
-    render_kwargs_test['raw_noise_std'] = 0.
-
-    start = 0
-    basedir = args.basedir
-    expname = args.expname
-
-    if args.ft_path is not None and args.ft_path != 'None':
-        ckpts = [args.ft_path]
-    else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
-                 ('model_' in f and 'fine' not in f and 'optimizer' not in f)]
-    print('Found ckpts', ckpts)
-    if len(ckpts) > 0 and not args.no_reload:
-        ft_weights = ckpts[-1]
-        print('Reloading from', ft_weights)
-        model.set_weights(np.load(ft_weights, allow_pickle=True))
-        start = int(ft_weights[-10:-4]) + 1
-        print('Resetting step to', start)
-
-        if model_fine is not None:
-            ft_weights_fine = '{}_fine_{}'.format(
-                ft_weights[:-11], ft_weights[-10:])
-            print('Reloading fine from', ft_weights_fine)
-            model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
-
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, models

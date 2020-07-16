@@ -1,0 +1,37 @@
+expname = 6_rs_cascade_32_32_fern_infLast
+basedir = /data/jiaxiang/viewSyn/logs_6_nerf_origin
+datadir = /data/jiaxiang/viewSyn/0_nerf_origin/0_nerf_llff_data/fern
+
+dataset_type = llff
+factor = 4
+llffhold = 8
+
+no_batching = False
+no_reload = False
+
+use_viewdirs = True
+lrate_decay = 2500
+raw_noise_std = 1.0
+
+N_samples = 32
+N_importance = 32
+N_rand = 8192
+
+max_global_steps = 600001
+i_img = 500
+i_testset = 50000
+i_video = 50000
+
+flag_patch_ray = False
+pr_patch_size = 4
+flag_cascade = True
+lrate = 3e-4
+
+lindisp = False
+flag_infinite_last = False
+
+
+
+
+
+

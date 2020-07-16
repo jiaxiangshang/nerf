@@ -2,7 +2,7 @@
 # when trained to 200k iters. Settings are the 
 # same for all other LLFF-style real scenes.
 
-expname = rs_paper_fern
+expname = rs_paper_fern_div
 basedir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/0_nerf_origin/logs_0_nerf_llff_data
 datadir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/0_nerf_origin/0_nerf_llff_data/fern
 dataset_type = llff
@@ -15,13 +15,24 @@ use_viewdirs = True
 lrate_decay = 250
 raw_noise_std = 1.0
 
-N_samples = 64
-N_importance = 128
-N_rand = 1024
+N_samples = 8
+N_importance = 32
+N_rand = 2048
 
-max_global_steps = 51
+max_global_steps = 6000001
 chunk = 16000
 i_print = 10
-i_img = 10
-i_testset = 1
-i_video = 51
+i_img = 100
+i_testset = 1000
+i_video = 20000
+
+flag_patch_ray = False
+pr_patch_size = 4
+flag_cascade = False
+lrate = 3e-4
+flag_range = False
+flag_div = True
+num_div = 12
+
+lindisp = False
+flag_infinite_last = False

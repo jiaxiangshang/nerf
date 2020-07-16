@@ -20,9 +20,11 @@ from tf_viewSyn.nerf.load_data.load_blender import load_blender_data
 #from tf_viewSyn.nerf.load_data.load_blmvs import load_blmvs_data
 
 from tf_viewSyn.nerf.build_graph_ray import *
-from tf_viewSyn.nerf.build_graph_patch import *
-from tf_viewSyn.nerf.build_graph_cascade import *
-from tf_viewSyn.nerf.build_graph_bg import *
+from tf_viewSyn.nerf.build_graph_patch import render_patch, create_nerf_patch
+from tf_viewSyn.nerf.build_graph_cascade import render_cascade
+from tf_viewSyn.nerf.build_graph_range import render_range, create_nerf_range
+from tf_viewSyn.nerf.build_graph_div import render_div, create_nerf_div
+#from tf_viewSyn.nerf.build_graph_bg import *
 
 tf.compat.v1.enable_eager_execution()
 
@@ -53,7 +55,7 @@ def config_parser():
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float,
                         default=5e-4, help='learning rate')
-    parser.add_argument("--lrate_decay", type=int, default=250,
+    parser.add_argument("--lrate_decay", type=int, default=250000,
                         help='exponential learning rate decay (in 1000s)')
     # training options: ray sample
     parser.add_argument("--N_rand", type=int, default=32*32*4,
@@ -102,6 +104,8 @@ def config_parser():
                         help='render the test set instead of render_poses path')
     parser.add_argument("--render_factor", type=int, default=0,
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+    parser.add_argument("--render_pcl_only", action='store_true',
+                        help='render the test set instead of render_poses path')
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff',
@@ -136,7 +140,7 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500,
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=50000,
+    parser.add_argument("--i_weights", type=int, default=25000,
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
@@ -152,6 +156,17 @@ def config_parser():
     parser.add_argument("--flag_cascade", type=ast.literal_eval, default=False,
                         help='frequency of render_poses video saving')
     parser.add_argument("--flag_bg", type=ast.literal_eval, default=False,
+                        help='frequency of render_poses video saving')
+
+    parser.add_argument("--flag_infinite_last", type=ast.literal_eval, default=True,
+                        help='frequency of render_poses video saving')
+
+    parser.add_argument("--flag_range", type=ast.literal_eval, default=False,
+                        help='frequency of render_poses video saving')
+
+    parser.add_argument("--flag_div", type=ast.literal_eval, default=False,
+                        help='frequency of render_poses video saving')
+    parser.add_argument("--num_div", type=int, default=12,
                         help='frequency of render_poses video saving')
 
     return parser
@@ -171,49 +186,52 @@ python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_
 
 python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern_patchRay.txt --no_ndc --spherify --lindisp
 
-python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern_cascadeWin.txt --no_ndc --spherify --lindisp
+python run_nerf.py --config ./config/paper_configs/0_reproduce_2048/LOCALconfig_rs_fern_cascade.txt --no_ndc --spherify --lindisp
 
+python run_nerf.py --config ./config//LOCALconfig_rs_fern_range.txt 
+
+python run_nerf.py --config ./config//LOCALconfig_rs_fern_div.txt --no_ndc
+
+# test
+python run_nerf.py --config ./config/visual_configs/config0_city_lib.txt --no_ndc --spherify --lindisp
 
 # 0 reproduce 2048
 bash
 
-# 1 patch 2048
-CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./config/paper_configs/1_patch_2048/config0_patch_fern.txt \
+# 1 patch 1048
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./config/paper_configs/1_patch_1024/config0_cascade_8_32_fern.txt \
 --no_ndc --spherify --lindisp
 
-CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./config/paper_configs/1_patch_2048/config4_patch_leaves.txt \
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./config/paper_configs/1_patch_1024/config4_patch_leaves.txt \
 --no_ndc --spherify --lindisp
 
-CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config ./config/paper_configs/1_patch_2048/config4_patch12_leaves.txt \
+CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config ./config/paper_configs/1_patch_1024/config4_patch12_leaves.txt \
 --no_ndc --spherify --lindisp
 
+# 2 cascade 4096
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./config/paper_configs/2_cascade_4/config0_cascade_8_32_fern.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./config/paper_configs/2_cascade_4/config4_cascade_8_32_leaves.txt \
+--no_ndc --spherify --lindisp
+
+CUDA_VISIBLE_DEVICES=1 python run_nerf.py --config ./config/paper_configs/2_cascade_4/config4_cascade_16_64_leaves.txt \
+--no_ndc --spherify --lindisp
+
+# 3 cascade 8196
+CUDA_VISIBLE_DEVICES=1 python run_nerf.py --config ./config/paper_configs/3_cascade_8/config0_cascade_8_32_fern.txt
+
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./config/paper_configs/3_cascade_8/config4_cascade_8_32_leaves.txt
+
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./config/paper_configs/3_cascade_8/config4_cascade_8_32_room.txt
+
+# 5
+CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config ./config/paper_configs/
+
+CUDA_VISIBLE_DEVICES=6 python run_nerf.py --config ./config/paper_configs/
 
 # 8-card
 CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_lib.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_tingzi.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_ball.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_bread.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=6 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_camera.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=7 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_gate.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=0 python run_nerf.py --config ./cascade_config/blendmvs_success/config_city_yunnan.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=1 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_car.txt \
---no_ndc --spherify --lindisp
-
-CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config ./cascade_config/blendmvs_success/config_obj_rock.txt \
 --no_ndc --spherify --lindisp
 
 
@@ -326,17 +344,38 @@ def train():
     # Create nerf model
     if args.flag_patch_ray:
         render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf_patch(args)
+    elif args.flag_range:
+        render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf_range(args)
+    elif args.flag_div:
+        render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf_div(args)
     else:
         render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(args)
+
+    render_kwargs_train['flag_infinite_last'] = args.flag_infinite_last
+    render_kwargs_test['flag_infinite_last'] = args.flag_infinite_last
+
+    render_kwargs_train['num_div'] = args.num_div
+    render_kwargs_test['num_div'] = args.num_div
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
         'far': tf.cast(far, tf.float32),
     }
+
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
     # Short circuit if only rendering out from trained model
+    if args.render_pcl_only:
+        # folder
+        testsavedir = os.path.join(basedir, expname, 'render_pcl_{}_{:06d}'.format('test' if args.render_test else 'path', start))
+        os.makedirs(testsavedir, exist_ok=True)
+        print('TEST: poses shape', render_poses.shape)
+
+        #
+        render_kwargs_test['retraw'] = True
+        rgbs, _ = render_mesh(render_poses, hwf, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir)
+
     if args.render_only:
         print('RENDER ONLY')
         if args.render_test:
@@ -360,16 +399,17 @@ def train():
         return
 
     # Create optimizer
-    lrate = args.lrate
-    if args.lrate_decay > 0:
-        lrate = tf.keras.optimizers.schedules.ExponentialDecay(
-            lrate, decay_steps=args.lrate_decay * 1000, decay_rate=0.1
-        )
-    optimizer = tf.keras.optimizers.Adam(lrate)
-    models['optimizer'] = optimizer
-
     global_step = tf.compat.v1.train.get_or_create_global_step()
     global_step.assign(start)
+
+    if args.lrate_decay > 0:
+        #lr_op = tf.train.exponential_decay(args.lrate, global_step=global_step, decay_steps=args.lrate_decay, decay_rate=0.1, name='lr')
+        lr_op = tf.keras.optimizers.schedules.ExponentialDecay(
+            args.lrate, decay_steps=args.lrate_decay, decay_rate=0.1
+        )
+    optimizer = tf.keras.optimizers.Adam(lr_op)
+    models['optimizer'] = optimizer
+
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
@@ -531,10 +571,44 @@ def train():
                 loss = img_loss
                 psnr = mse2psnr(img_loss)
 
+                #Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    #loss += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+            elif args.flag_range:
+                rgb, disp, acc, extras = render_range(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                #loss = img_loss
+                psnr = mse2psnr(img_loss)
+
+                #Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    #loss += img_loss0
+                    loss = img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+            elif args.flag_div:
+                rgb, disp, acc, extras = render_div(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                loss = img_loss
+                psnr = mse2psnr(img_loss)
+
                 # Add MSE loss for coarse-grained model
                 if 'rgb0' in extras:
                     img_loss0 = img2mse(extras['rgb0'], target_s)
-                    loss += img_loss0
+                    # loss += img_loss0
+                    loss = img_loss0
                     psnr0 = mse2psnr(img_loss0)
             elif args.flag_bg:
                 rgb, disp, acc, extras = render_bg(
@@ -588,8 +662,12 @@ def train():
                 tf.contrib.summary.scalar('loss', loss)
                 tf.contrib.summary.scalar('psnr', psnr)
                 tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
+                if args.N_importance > 0 and 'rgb0' in extras:
                     tf.contrib.summary.scalar('psnr0', psnr0)
+
+                # lr_callback = tf.keras.callbacks.LearningRateScheduler()
+                # tf.contrib.summary.scalar('lrate', lr_callback)
+
 
         if i % args.i_img == 0:
             # Log a rendered validation view to Tensorboard
@@ -600,11 +678,16 @@ def train():
                 rgb, disp, acc, extras = render_patch(H, W, focal, chunk=int(args.chunk / (args.pr_patch_size*args.pr_patch_size)),
                                                       c2w=pose, pr_patch_size=args.pr_patch_size, **render_kwargs_test)
             elif args.flag_cascade:
-                rgb, disp, acc, extras = render_cascade(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
+                rgb, disp, acc, extras = render_cascade(H, W, focal, chunk=args.chunk, c2w=pose, **render_kwargs_test)
+            elif args.flag_range:
+                rgb, disp, acc, extras = render_range(H, W, focal, chunk=args.chunk, c2w=pose, **render_kwargs_test)
+            elif args.flag_div:
+                rgb, disp, acc, extras = render_div(H, W, focal, chunk=args.chunk, c2w=pose, **render_kwargs_test)
             else:
                 rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
+
+                tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
 
             psnr = mse2psnr(img2mse(rgb, target))
 
@@ -622,7 +705,7 @@ def train():
                 tf.contrib.summary.scalar('psnr_holdout', psnr)
                 tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
 
-            if args.N_importance > 0:
+            if args.N_importance > 0 and 'rgb0' in extras:
                 with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
                     tf.contrib.summary.image(
                         'rgb0', to8b(extras['rgb0'])[tf.newaxis])
@@ -638,7 +721,16 @@ def train():
         if i % args.i_video == 0 and i > 0:
             if args.flag_patch_ray:
                 rgbs, disps = render_path(
-                    render_poses, hwf, args.chunk, render_kwargs_test, pr_patch_size=args.pr_patch_size)
+                    render_poses, hwf, args.chunk, render_kwargs_test, mode_try='patch', pr_patch_size=args.pr_patch_size)
+            elif args.flag_cascade:
+                rgbs, disps = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test, mode_try='cascade')
+            elif args.flag_range:
+                rgbs, disps = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test, mode_try='range')
+            elif args.flag_div:
+                rgbs, disps = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test, mode_try='div')
             else:
                 rgbs, disps = render_path(
                     render_poses, hwf, args.chunk, render_kwargs_test)
@@ -646,22 +738,28 @@ def train():
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4',
-                             to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4',
-                             to8b(disps / np.max(disps)), fps=30, quality=8)
+            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
                 if args.flag_patch_ray:
                     rgbs_still, _ = render_path(
-                        render_poses, hwf, args.chunk, render_kwargs_test, pr_patch_size=args.pr_patch_size)
+                        render_poses, hwf, args.chunk, render_kwargs_test, mode_try='patch', pr_patch_size=args.pr_patch_size)
+                elif args.flag_cascade:
+                    rgbs_still, _ = render_path(
+                        render_poses, hwf, args.chunk, render_kwargs_test, mode_try='cascade')
+                elif args.flag_range:
+                    rgbs_still, _ = render_path(
+                        render_poses, hwf, args.chunk, render_kwargs_test, mode_try='range')
+                elif args.flag_div:
+                    rgbs_still, _ = render_path(
+                        render_poses, hwf, args.chunk, render_kwargs_test, mode_try='div')
                 else:
                     rgbs_still, _ = render_path(
                         render_poses, hwf, args.chunk, render_kwargs_test)
                 render_kwargs_test['c2w_staticcam'] = None
-                imageio.mimwrite(moviebase + 'rgb_still.mp4',
-                                 to8b(rgbs_still), fps=30, quality=8)
+                imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         if i % args.i_testset == 0 and i > 0:
             testsavedir = os.path.join(
@@ -669,14 +767,198 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('TEST: test poses shape', poses[i_test].shape)
             if args.flag_patch_ray:
-                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i)
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i, mode_try='patch', pr_patch_size=args.pr_patch_size)
+            elif args.flag_cascade:
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i, mode_try='cascade')
+            elif args.flag_range:
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i, mode_try='range')
+            elif args.flag_div:
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i, mode_try='div')
             else:
-                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test],
-                            savedir=testsavedir, iter=i, pr_patch_size=args.pr_patch_size)
+                render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, iter=i)
             print('TEST: saved test set')
 
 
         global_step.assign_add(1)
+
+
+
+def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, iter=None, mode_try='nerf', pr_patch_size=None):
+    H, W, focal = hwf
+
+    if render_factor != 0:
+        # Render downsampled for speed
+        H = H // render_factor
+        W = W // render_factor
+        focal = focal / render_factor
+
+    if iter is not None:
+        f_eval = open(os.path.join(savedir, 'eval.txt'), 'w')
+
+    rgbs = []
+    disps = []
+
+    list_psnr_error = []
+    list_ssim_error = []
+
+    t_st = time.time()
+    for i, c2w in enumerate(render_poses):
+        print("Render_path", i, time.time() - t_st)
+        if mode_try == 'patch':
+            rgb, disp, acc, extras = render_patch(H, W, focal,
+                                                  chunk=int(chunk / (pr_patch_size * pr_patch_size)),
+                                                  c2w=c2w[:3, :4], pr_patch_size=pr_patch_size, **render_kwargs)
+        elif mode_try == 'cascade':
+            rgb, disp, acc, extras = render_cascade(H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        elif mode_try == 'range':
+            rgb, disp, acc, extras = render_range(H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        elif mode_try == 'div':
+            rgb, disp, acc, extras = render_div(H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        else:
+            rgb, disp, acc, extras = render(H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+
+        rgbs.append(rgb.numpy())
+        disps.append(disp.numpy())
+        if i == 0:
+            print(rgb.shape, disp.shape)
+
+        if gt_imgs is not None and render_factor == 0:
+            # 0. MSE
+            mse_pure = np.mean(np.square(rgb - gt_imgs[i]), axis=2)
+            #print('Debug: ', mse_pure.shape, mse_pure.min(), mse_pure.max())
+            v_mse_pure = pixel_error_heatmap(mse_pure)[0]
+            #print('Debug: ', v_mse_pure.shape, v_mse_pure.min(), v_mse_pure.max())
+
+            psnr_pure = -10. * np.log10(mse_pure)
+            v_psnr_pure = pixel_error_heatmap(psnr_pure)[0]
+
+
+            # 0. PSNR
+            psnr_error = np.mean(psnr_pure)
+            list_psnr_error.append(psnr_error)
+
+            # 1. SSIM
+            ssim_none = ssim(np.array(rgb), np.array(gt_imgs[i]), data_range=gt_imgs[i].max() - gt_imgs[i].min(), win_size=3, multichannel=True)
+            list_ssim_error.append(ssim_none)
+
+            if savedir is not None:
+                rgb8 = to8b(v_mse_pure)
+                filename_mse = os.path.join(savedir, '{:03d}_mse.png'.format(i))
+                imageio.imwrite(filename_mse, rgb8)
+
+                rgb8 = to8b(v_psnr_pure)
+                filename_psnr = os.path.join(savedir, '{:03d}_psnr.png'.format(i))
+                imageio.imwrite(filename_psnr, rgb8)
+
+            if iter is not None:
+                f_eval.write('Iter %d: psnr error=%.3f, ssim error=%.3f\n' % (iter, psnr_error, ssim_none))
+                #print('Iter %d: psnr error=%.3f, ssim error=%.3f\n' % (iter, psnr_error, ssim_none))
+
+        if savedir is not None:
+            rgb8 = to8b(rgbs[-1])
+            filename = os.path.join(savedir, '{:03d}.png'.format(i))
+            imageio.imwrite(filename, rgb8)
+
+            rgb8 = to8b(disps[-1])
+            filename = os.path.join(savedir, '{:03d}_disp.png'.format(i))
+            imageio.imwrite(filename, rgb8)
+
+            alpha = extras['alpha'].numpy()
+            if 'alpha_0' in extras:
+                alpha_0 = extras['alpha_0'].numpy()
+            else:
+                alpha_0 = alpha
+            filename = os.path.join(savedir, '{:03d}_alpha.npz'.format(i))
+            np.savez(filename, alpha=alpha, alpha_0=alpha_0)
+
+    np_list_psnr_error = np.array(list_psnr_error)
+    np_list_ssim_error = np.array(list_ssim_error)
+    if iter is not None:
+        f_eval.write('Finally aver: psnr error=%.3f, ssim error=%.3f\n' % (np.mean(np_list_psnr_error), np.mean(np_list_ssim_error)))
+        t_end = time.time()
+        f_eval.write('Testing time=%.3f\n' % (t_end-t_st))
+        f_eval.close()
+
+    rgbs = np.stack(rgbs, 0)
+    disps = np.stack(disps, 0)
+
+    return rgbs, disps
+
+
+def render_mesh(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, mode_try='nerf'):
+    H, W, focal = hwf
+
+    rgbs = []
+    disps = []
+
+    list_psnr_error = []
+    list_ssim_error = []
+
+    t_st = time.time()
+    for i, c2w in enumerate(render_poses):
+        print("Render_path", i, time.time() - t_st)
+        if mode_try == 'patch':
+            rgb, disp, acc, extras = render_patch(H, W, focal, chunk=int(chunk / (pr_patch_size * pr_patch_size)),
+                                                  c2w=c2w[:3, :4], pr_patch_size=pr_patch_size, **render_kwargs)
+        elif mode_try == 'cascade':
+            rgb, disp, acc, extras = render_cascade(H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        else:
+            rgb, disp, acc, extras = render(H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+
+        rgbs.append(rgb.numpy())
+        disps.append(disp.numpy())
+
+        raw = extras['raw']
+        sigma = np.maximum(raw[..., -1], 0.)
+
+        import matplotlib.pyplot as plt
+        # plt.imshow(rgb)
+        # plt.show()
+        rgb8 = to8b(rgbs[-1])
+        filename = os.path.join(savedir, '{:03d}.png'.format(i))
+        imageio.imwrite(filename, rgb8)
+
+        #
+        import mcubes
+
+        threshold = 50.
+        print('fraction occupied', np.mean(sigma > threshold))
+
+        vertices, triangles = mcubes.marching_cubes(sigma, threshold)
+        print('done', vertices.shape, triangles.shape)
+        import trimesh
+
+        mesh = trimesh.Trimesh(vertices, triangles)
+        #mesh.show()
+        filename_mesh = os.path.join(savedir, '{:03d}_mesh.ply'.format(i))
+        mesh.export(filename_mesh)
+
+        #
+        image = rgb.numpy()
+        depthmap = 1 / disp.numpy()
+        points = []
+        scalingFactor = 1
+        focalLength = 100
+        for v in range(image.shape[1]):
+            for u in range(image.shape[0]):
+                color = image[u, v]
+                Z = depthmap[u, v] / scalingFactor
+                if Z == 0: continue
+                X = (u - image.shape[0]/2) * Z / focalLength
+                Y = (v - image.shape[1]/2) * Z / focalLength
+                points.append([X, Y, Z])
+                print(X, Y, Z)
+        points = np.array(points)
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        filename_mesh = os.path.join(savedir, '{:03d}_pcl.ply'.format(i))
+        o3d.io.write_point_cloud(filename_mesh, pcd)
+
+    rgbs = np.stack(rgbs, 0)
+    disps = np.stack(disps, 0)
+
+    return rgbs, disps
 
 
 if __name__ == '__main__':

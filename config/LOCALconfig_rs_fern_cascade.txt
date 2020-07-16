@@ -16,15 +16,17 @@ lrate_decay = 250
 raw_noise_std = 1.0
 
 N_samples = 8
-N_importance = 64
+N_importance = 32
 N_rand = 512
 
-max_global_steps = 601
+max_global_steps = 6000001
 chunk = 16000
-i_print = 10
-i_img = 500
-i_testset = 500
-i_video = 501
+i_print = 100
+i_img = 2000
+i_testset = 1
+i_video = 2
 
-flag_patch_ray = True
+flag_patch_ray = False
 pr_patch_size = 4
+flag_cascade = True
+lrate = 3e-5

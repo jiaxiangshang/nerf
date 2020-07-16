@@ -57,14 +57,14 @@ class Embedder:
         return pos_encode
 
 
-def get_embedder(multires, i=0):
+def get_embedder(multires, i=0, input_dims=3):
 
     if i == -1:
         return tf.identity, 3
 
     embed_kwargs = {
         'include_input': True,
-        'input_dims': 3,
+        'input_dims': input_dims,
         'max_freq_log2': multires-1,
         'num_freqs': multires,
         'log_sampling': True,
@@ -82,7 +82,7 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
-    print('MODEL', input_ch, input_ch_views, type(input_ch), type(input_ch_views), use_viewdirs)
+    print('MODEL coarse', input_ch, input_ch_views, type(input_ch), type(input_ch_views), use_viewdirs)
     input_ch = int(input_ch)
     input_ch_views = int(input_ch_views)
 

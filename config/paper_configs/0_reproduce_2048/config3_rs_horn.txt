@@ -9,7 +9,7 @@ llffhold = 8
 no_batching = False
 no_reload=  False
 
-max_global_steps = 200000
+max_global_steps = 200001
 use_viewdirs = True
 lrate_decay = 250
 raw_noise_std = 1.0

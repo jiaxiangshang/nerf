@@ -1,0 +1,32 @@
+expname = 2_rs_cascade_8_32_leaves
+basedir = /ssd2/jiaxiang/viewSyn/logs_2_nerf_cascade
+datadir = /ssd2/jiaxiang/viewSyn/0_nerf_origin/0_nerf_llff_data/leaves
+
+dataset_type = llff
+factor = 4
+llffhold = 8
+
+no_batching = False
+no_reload = False
+
+use_viewdirs = True
+lrate_decay = 2500
+raw_noise_std = 1.0
+
+N_samples = 8
+N_importance = 32
+N_rand = 8192
+
+max_global_steps = 2000001
+i_img = 5000
+i_testset = 200005
+i_video = 200005
+
+flag_patch_ray = False
+pr_patch_size = 4
+flag_cascade = True
+lrate = 3e-4
+
+
+
+

@@ -1,0 +1,28 @@
+expname = blendmvs_city_lib
+basedir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/logs_2_blmvs_colmap
+datadir = /home/jshang/SHANG_Data/8_cvpr2021_trainingData/2_blmvs_colmap/city_lib
+
+dataset_type = llff
+factor = 4
+llffhold = 8
+
+no_batching = False
+no_reload = False
+
+max_global_steps = 200001
+use_viewdirs = True
+lrate_decay = 250
+raw_noise_std = 1.0
+
+N_samples = 256
+N_importance = 0
+N_rand = 512
+
+render_pcl_only = True
+chunk = 16000
+
+
+
+
+
+
